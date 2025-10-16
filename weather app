@@ -1,0 +1,492 @@
+#!/usr/bin/env python3
+"""
+Tkinter Weather App (single-file, Python 3.10)
+
+Features:
+- Manual location input (city name or "lat,lon")
+- Automatic location detection via IP geolocation
+- Detailed weather from Open-Meteo (no API key)
+- Current weather, hourly (12h) and daily (7d) forecasts
+- Wind speed, humidity, sunrise/sunset
+- Small temperature line chart using Tkinter Canvas
+- Uses only: requests (pip install requests)
+
+Run:
+    python weather_app.py
+"""
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+import requests
+import threading
+import math
+from datetime import datetime, timedelta, timezone
+
+# ----------------------------
+# Configurable constants
+# ----------------------------
+IP_GEO_URL = "http://ip-api.com/json/"  # returns JSON with lat/lon
+OPEN_METEO_BASE = "https://api.open-meteo.com/v1/forecast"
+DEFAULT_LANG = "en"
+DEFAULT_UNITS = "metric"  # 'metric' or 'imperial' (we convert wind if imperial)
+HOUR_COUNT = 12  # how many hours in hourly view
+DAY_COUNT = 7    # how many days in daily view
+
+# ----------------------------
+# Weathercode (WMO) -> emoji + description
+# Source: Open-Meteo uses WMO weather codes
+# ----------------------------
+WMO_MAP = {
+    0: ("☀️", "Clear sky"),
+    1: ("🌤️", "Mainly clear"),
+    2: ("⛅", "Partly cloudy"),
+    3: ("☁️", "Overcast"),
+    45: ("🌫️", "Fog"),
+    48: ("🌫️", "Depositing rime fog"),
+    51: ("🌦️", "Light drizzle"),
+    53: ("🌦️", "Moderate drizzle"),
+    55: ("🌧️", "Dense drizzle"),
+    56: ("🌧️", "Freezing drizzle"),
+    57: ("🌧️", "Dense freezing drizzle"),
+    61: ("🌧️", "Slight rain"),
+    63: ("🌧️", "Moderate rain"),
+    65: ("🌧️", "Heavy rain"),
+    66: ("🌧️", "Freezing rain"),
+    67: ("🌧️", "Heavy freezing rain"),
+    71: ("🌨️", "Slight snow fall"),
+    73: ("🌨️", "Moderate snow fall"),
+    75: ("🌨️", "Heavy snow fall"),
+    77: ("🌨️", "Snow grains"),
+    80: ("🌦️", "Slight rain showers"),
+    81: ("🌧️", "Moderate rain showers"),
+    82: ("⛈️", "Violent rain showers"),
+    85: ("🌨️", "Slight snow showers"),
+    86: ("🌨️", "Heavy snow showers"),
+    95: ("⛈️", "Thunderstorm"),
+    96: ("⛈️", "Thunderstorm with slight hail"),
+    99: ("⛈️", "Thunderstorm with heavy hail"),
+}
+
+# ----------------------------
+# Utilities
+# ----------------------------
+
+def wmo_to_icon_desc(code: int):
+    return WMO_MAP.get(code, ("❓", "Unknown"))
+
+def deg_to_compass(deg: float) -> str:
+    dirs = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"]
+    idx = int((deg / 22.5) + 0.5) % 16
+    return dirs[idx]
+
+def c_to_f(c: float) -> float:
+    return c * 9/5 + 32
+
+def ms_to_mph(ms: float) -> float:
+    return ms * 2.2369362920544
+
+# Format timestamp string in app timezone
+def format_time_iso(ts_iso: str, tz_str: str="UTC"):
+    # Open-Meteo returns ISO strings with timezone set when timezone param used
+    try:
+        dt = datetime.fromisoformat(ts_iso)
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return ts_iso
+
+# ----------------------------
+# Networking (runs inside threads)
+# ----------------------------
+
+def geolocate_by_ip() -> tuple[float, float, str] | None:
+    """
+    Uses ip-api.com to find approximate lat/lon and city.
+    Returns (lat, lon, city) or None on failure.
+    """
+    try:
+        r = requests.get(IP_GEO_URL, timeout=8)
+        r.raise_for_status()
+        j = r.json()
+        if j.get("status") == "success":
+            lat = float(j.get("lat"))
+            lon = float(j.get("lon"))
+            city = j.get("city") or f"{j.get('regionName')}, {j.get('country')}"
+            return lat, lon, city
+    except Exception:
+        return None
+
+def geocode_city(city_name: str) -> tuple[float, float, str] | None:
+    """
+    Simple geocoding via Open-Meteo's geocoding endpoint.
+    Returns (lat, lon, display_name) or None.
+    """
+    try:
+        params = {"name": city_name, "count": 5}
+        r = requests.get("https://geocoding-api.open-meteo.com/v1/search", params=params, timeout=10)
+        r.raise_for_status()
+        j = r.json()
+        results = j.get("results")
+        if results and len(results) > 0:
+            top = results[0]
+            lat = float(top["latitude"])
+            lon = float(top["longitude"])
+            name = top.get("name")
+            admin = top.get("admin1")
+            country = top.get("country")
+            display = ", ".join([p for p in [name, admin, country] if p])
+            return lat, lon, display
+        else:
+            return None
+    except Exception:
+        return None
+
+def fetch_weather(lat: float, lon: float, units: str = DEFAULT_UNITS, lang: str = DEFAULT_LANG) -> dict | None:
+    """
+    Fetch weather from Open-Meteo. Returns parsed JSON dict or None on error.
+    """
+    try:
+        params = {
+            "latitude": lat,
+            "longitude": lon,
+            "hourly": "temperature_2m,apparent_temperature,precipitation,weathercode,windspeed_10m,winddirection_10m,relativehumidity_2m",
+            "daily": "temperature_2m_max,temperature_2m_min,weathercode,sunrise,sunset",
+            "current_weather": "true",
+            "timezone": "auto",
+        }
+        r = requests.get(OPEN_METEO_BASE, params=params, timeout=12)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
+
+# ----------------------------
+# Tkinter GUI
+# ----------------------------
+
+class WeatherApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("WeatherNow — Tkinter Weather App")
+        self.geometry("820x640")
+        self.resizable(False, False)
+        self.style = ttk.Style(self)
+        # Use default theme
+        self.units = tk.StringVar(value=DEFAULT_UNITS)
+        self.location_var = tk.StringVar()
+        self.status_var = tk.StringVar(value="Ready")
+        self._build_ui()
+        self.current_location = None  # (lat, lon, name)
+
+    def _build_ui(self):
+        top = ttk.Frame(self, padding=(10,10))
+        top.pack(fill="x")
+
+        ttk.Label(top, text="Location:").grid(row=0, column=0, sticky="w")
+        loc_entry = ttk.Entry(top, width=40, textvariable=self.location_var)
+        loc_entry.grid(row=0, column=1, padx=6, sticky="w")
+        loc_entry.bind("<Return>", lambda e: self.get_weather_from_entry())
+
+        detect_btn = ttk.Button(top, text="Auto Detect (IP)", command=self.detect_location)
+        detect_btn.grid(row=0, column=2, padx=6)
+
+        get_btn = ttk.Button(top, text="Get Weather", command=self.get_weather_from_entry)
+        get_btn.grid(row=0, column=3, padx=6)
+
+        unit_frame = ttk.Frame(top)
+        unit_frame.grid(row=0, column=4, padx=10)
+        ttk.Radiobutton(unit_frame, text="Celsius", value="metric", variable=self.units).pack(side="left")
+        ttk.Radiobutton(unit_frame, text="Fahrenheit", value="imperial", variable=self.units).pack(side="left")
+
+        # Main content frames
+        content = ttk.Frame(self, padding=(10,6))
+        content.pack(fill="both", expand=True)
+
+        # Left: Current & graph
+        left = ttk.Frame(content)
+        left.pack(side="left", fill="y", padx=(0,10))
+
+        self.header_lbl = ttk.Label(left, text="WeatherNow", font=("Segoe UI", 18, "bold"))
+        self.header_lbl.pack(anchor="w")
+
+        self.current_frame = ttk.LabelFrame(left, text="Current Conditions", width=360, height=160)
+        self.current_frame.pack(fill="x", pady=(6,10))
+
+        self.icon_lbl = ttk.Label(self.current_frame, text="", font=("Segoe UI", 36))
+        self.icon_lbl.grid(row=0, column=0, rowspan=2, padx=8, pady=6)
+
+        self.summary_lbl = ttk.Label(self.current_frame, text="", font=("Segoe UI", 12))
+        self.summary_lbl.grid(row=0, column=1, sticky="w", padx=4, pady=(12,2))
+
+        self.temp_lbl = ttk.Label(self.current_frame, text="", font=("Segoe UI", 28))
+        self.temp_lbl.grid(row=1, column=1, sticky="w", padx=4)
+
+        self.details_lbl = ttk.Label(self.current_frame, text="", font=("Segoe UI", 9))
+        self.details_lbl.grid(row=2, column=0, columnspan=2, sticky="w", padx=8, pady=(6,8))
+
+        # canvas for hourly temp plot
+        self.canvas_frame = ttk.LabelFrame(left, text=f"Hourly Temp (next {HOUR_COUNT} hrs)")
+        self.canvas_frame.pack(fill="both", expand=False, pady=(0,10))
+        self.canvas = tk.Canvas(self.canvas_frame, width=360, height=150, bg="white")
+        self.canvas.pack(padx=4, pady=4)
+
+        # Right: Forecast lists
+        right = ttk.Frame(content)
+        right.pack(side="left", fill="both", expand=True)
+
+        self.hourly_frame = ttk.LabelFrame(right, text=f"Hourly Forecast (next {HOUR_COUNT} hrs)")
+        self.hourly_frame.pack(fill="x", padx=4, pady=(0,8))
+        self.hourly_list = tk.Listbox(self.hourly_frame, height=8)
+        self.hourly_list.pack(fill="x", padx=6, pady=6)
+
+        self.daily_frame = ttk.LabelFrame(right, text=f"Daily Forecast (next {DAY_COUNT} days)")
+        self.daily_frame.pack(fill="both", expand=True, padx=4, pady=(0,8))
+        self.daily_list = tk.Listbox(self.daily_frame)
+        self.daily_list.pack(fill="both", expand=True, padx=6, pady=6)
+
+        # Status bar
+        status = ttk.Frame(self)
+        status.pack(fill="x", side="bottom")
+        ttk.Label(status, textvariable=self.status_var).pack(side="left", padx=6, pady=4)
+        ttk.Button(status, text="About", command=self._about).pack(side="right", padx=6)
+
+    def _about(self):
+        messagebox.showinfo("About WeatherNow",
+                            "WeatherNow — sample Tkinter weather app\n\n"
+                            "Data from Open-Meteo (no API key required).\n"
+                            "Auto location uses IP geolocation (approximate).\n\n"
+                            "Built for Python 3.10")
+
+    def detect_location(self):
+        self.status_var.set("Detecting location via IP...")
+        threading.Thread(target=self._detect_location_thread, daemon=True).start()
+
+    def _detect_location_thread(self):
+        result = geolocate_by_ip()
+        if result:
+            lat, lon, city = result
+            self.current_location = (lat, lon, city)
+            self.location_var.set(city)
+            self.status_var.set(f"Detected: {city} ({lat:.3f}, {lon:.3f}) — fetching weather...")
+            self._fetch_and_display(lat, lon, city)
+        else:
+            self.status_var.set("Location detection failed.")
+            messagebox.showerror("Location Error", "Automatic location detection failed. You can type a city name (e.g., 'London') or lat,lon.")
+
+    def get_weather_from_entry(self):
+        txt = self.location_var.get().strip()
+        if not txt:
+            messagebox.showinfo("Input required", "Please type a city name (e.g., 'Paris') or coordinates as 'lat,lon', or use Auto Detect.")
+            return
+        # Try to parse lat,lon
+        if "," in txt:
+            # try lat,lon pair
+            parts = txt.split(",")
+            try:
+                lat = float(parts[0].strip())
+                lon = float(parts[1].strip())
+                name = f"{lat:.3f},{lon:.3f}"
+                self.current_location = (lat, lon, name)
+                self.status_var.set(f"Using coordinates {name}. Fetching weather...")
+                threading.Thread(target=lambda: self._fetch_and_display(lat, lon, name), daemon=True).start()
+                return
+            except Exception:
+                # fallthrough to treat as city name
+                pass
+        # treat as city name -> geocode
+        self.status_var.set(f"Geocoding '{txt}'...")
+        threading.Thread(target=self._geocode_then_fetch, args=(txt,), daemon=True).start()
+
+    def _geocode_then_fetch(self, txt):
+        res = geocode_city(txt)
+        if res:
+            lat, lon, display = res
+            self.current_location = (lat, lon, display)
+            self.status_var.set(f"Location: {display} ({lat:.3f}, {lon:.3f}) — fetching weather...")
+            self._fetch_and_display(lat, lon, display)
+        else:
+            self.status_var.set("Geocoding failed.")
+            messagebox.showerror("Geocode Error", f"Could not find location: {txt}")
+
+    def _fetch_and_display(self, lat, lon, display_name):
+        # Fetch weather (in thread)
+        data = fetch_weather(lat, lon)
+        if not data:
+            self.status_var.set("Weather fetch failed.")
+            messagebox.showerror("Weather Error", "Failed to fetch weather data. Check your internet connection.")
+            return
+        # Prepare and update UI on main thread
+        self.after(0, lambda: self._update_ui_with_data(data, display_name))
+
+    def _update_ui_with_data(self, data: dict, display_name: str):
+        tz = data.get("timezone", "UTC")
+        current = data.get("current_weather", {})
+        hourly = data.get("hourly", {})
+        daily = data.get("daily", {})
+
+        # Update header
+        self.header_lbl.config(text=f"WeatherNow — {display_name}")
+
+        # Current
+        cur_temp = current.get("temperature")
+        cur_wind = current.get("windspeed")
+        cur_wind_dir = current.get("winddirection", 0)
+        cur_code = current.get("weathercode", 0)
+        icon, desc = wmo_to_icon_desc(cur_code)
+        units = self.units.get()
+        # temperature display
+        if units == "imperial":
+            display_temp = f"{c_to_f(cur_temp):.1f}°F"
+            display_wind = f"{ms_to_mph(cur_wind):.1f} mph"
+        else:
+            display_temp = f"{cur_temp:.1f}°C"
+            display_wind = f"{cur_wind:.1f} m/s"
+        self.icon_lbl.config(text=icon)
+        self.summary_lbl.config(text=desc)
+        self.temp_lbl.config(text=display_temp)
+        details_text = f"Wind: {display_wind} {deg_to_compass(cur_wind_dir)}    Timezone: {tz}"
+        self.details_lbl.config(text=details_text)
+
+        # Hourly list
+        self.hourly_list.delete(0, tk.END)
+        # We expect hourly['time'] and hourly['temperature_2m'], and weathercode, windspeed_10m, relativehumidity_2m
+        times = hourly.get("time", [])
+        temps = hourly.get("temperature_2m", [])
+        codes = hourly.get("weathercode", [])
+        windsp = hourly.get("windspeed_10m", [])
+        rh = hourly.get("relativehumidity_2m", [])
+
+        # find index of current time in hourly times to start from next hour
+        now_iso = current.get("time")
+        start_idx = 0
+        try:
+            if now_iso in times:
+                start_idx = times.index(now_iso) + 1
+        except Exception:
+            start_idx = 0
+
+        # build hourly items
+        hourly_items = []
+        for i in range(start_idx, min(start_idx + HOUR_COUNT, len(times))):
+            t = times[i]
+            tt = format_time_iso(t, tz)
+            temp_c = temps[i]
+            code = codes[i] if i < len(codes) else None
+            w = windsp[i] if i < len(windsp) else None
+            hum = rh[i] if i < len(rh) else None
+            icon_h, desc_h = wmo_to_icon_desc(code) if code is not None else ("?", "")
+            if units == "imperial":
+                t_display = f"{c_to_f(temp_c):.1f}°F"
+                wind_display = f"{ms_to_mph(w):.1f} mph" if w is not None else "N/A"
+            else:
+                t_display = f"{temp_c:.1f}°C"
+                wind_display = f"{w:.1f} m/s" if w is not None else "N/A"
+            item = f"{tt}  {icon_h} {t_display}  Wind: {wind_display}  RH: {hum}%"
+            hourly_items.append((item, temp_c))
+            self.hourly_list.insert(tk.END, item)
+
+        # Draw temp plot for hourly temperatures (using Celsius values but converting if imperial for labels)
+        if hourly_items:
+            temps_for_plot = [t for _, t in hourly_items]
+            if units == "imperial":
+                temps_plot = [c_to_f(tc) for tc in temps_for_plot]
+            else:
+                temps_plot = temps_for_plot
+            self._draw_temp_plot(temps_plot)
+
+        # Daily list
+        self.daily_list.delete(0, tk.END)
+        d_times = daily.get("time", [])
+        d_max = daily.get("temperature_2m_max", [])
+        d_min = daily.get("temperature_2m_min", [])
+        d_codes = daily.get("weathercode", [])
+        d_sunrise = daily.get("sunrise", [])
+        d_sunset = daily.get("sunset", [])
+
+        for i in range(min(DAY_COUNT, len(d_times))):
+            day = d_times[i]
+            try:
+                day_dt = datetime.fromisoformat(day)
+                day_label = day_dt.strftime("%a %b %d")
+            except Exception:
+                day_label = day
+            maxc = d_max[i] if i < len(d_max) else None
+            minc = d_min[i] if i < len(d_min) else None
+            code = d_codes[i] if i < len(d_codes) else None
+            icon_d, desc_d = wmo_to_icon_desc(code) if code is not None else ("?", "")
+            if maxc is None or minc is None:
+                continue
+            if units == "imperial":
+                maxd = c_to_f(maxc)
+                mind = c_to_f(minc)
+                temps_str = f"{maxd:.1f}°F / {mind:.1f}°F"
+            else:
+                temps_str = f"{maxc:.1f}°C / {minc:.1f}°C"
+            sun = ""
+            if i < len(d_sunrise) and i < len(d_sunset):
+                sr = format_time_iso(d_sunrise[i], tz).split(" ")[1]
+                ss = format_time_iso(d_sunset[i], tz).split(" ")[1]
+                sun = f" ☀ {sr}/{ss}"
+            item = f"{day_label}  {icon_d}  {temps_str}  {desc_d}{sun}"
+            self.daily_list.insert(tk.END, item)
+
+        self.status_var.set("Weather updated.")
+
+    def _draw_temp_plot(self, temps):
+        self.canvas.delete("all")
+        w = int(self.canvas["width"])
+        h = int(self.canvas["height"])
+        padding = 28
+        n = len(temps)
+        if n == 0:
+            return
+        min_t = min(temps)
+        max_t = max(temps)
+        # make some breathing room
+        span = max(1.0, max_t - min_t)
+        min_t -= 0.15 * span
+        max_t += 0.15 * span
+        span = max_t - min_t
+
+        # compute points
+        xs = []
+        ys = []
+        for i, t in enumerate(temps):
+            x = padding + (w - 2*padding) * (i / (n - 1 if n>1 else 1))
+            y = padding + (h - 2*padding) * (1 - (t - min_t) / span)
+            xs.append(x)
+            ys.append(y)
+
+        # axes
+        self.canvas.create_line(padding, h - padding, w - padding, h - padding, width=1)
+        self.canvas.create_line(padding, padding, padding, h - padding, width=1)
+
+        # polyline
+        points = []
+        for x, y in zip(xs, ys):
+            points.extend((x, y))
+        self.canvas.create_line(*points, smooth=True, width=2)
+
+        # points & labels
+        for i, (x, y) in enumerate(zip(xs, ys)):
+            self.canvas.create_oval(x-3, y-3, x+3, y+3, fill="black")
+            # label below
+            lbl = f"{temps[i]:.0f}"
+            self.canvas.create_text(x, h - padding + 12, text=lbl, anchor="n", font=("Segoe UI", 8))
+
+# ----------------------------
+# Run the app
+# ----------------------------
+
+if __name__ == "__main__":
+    # quick dependency check
+    try:
+        import requests  # already used, but we check to give friendly message
+    except Exception:
+        message = ("This app requires the 'requests' library.\n"
+                   "Install with: pip install requests\n"
+                   "Then re-run this program.")
+        tk.Tk().withdraw()
+        messagebox.showerror("Missing dependency", message)
+        raise SystemExit(message)
+    app = WeatherApp()
+    app.mainloop()
